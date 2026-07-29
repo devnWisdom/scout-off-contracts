@@ -960,6 +960,205 @@ impl VerificationContract {
         Ok(next_index)
     }
 
+    /// Approve milestones for multiple players in a single atomic transaction.
+    ///
+    /// Applies the same validation as `approve_milestone` to every entry.
+    /// If any entry fails (inactive validator, duplicate evidence, per-player
+    /// limit exceeded, etc.) the **entire batch** is rolled back — no partial
+    /// state is written.
+    ///
+    /// `entries` — `(player_id, description, evidence_hash)` tuples, one per
+    /// milestone to approve.  The maximum batch size is 20 entries.
+    ///
+    /// Returns a `Vec<u32>` of the per-player milestone indices assigned to each
+    /// entry, in the same order as the input.
+    pub fn batch_approve_milestones(
+        env: Env,
+        validator_wallet: Address,
+        entries: Vec<(u64, String, String)>,
+    ) -> Result<Vec<u32>, VerificationError> {
+        Self::require_not_paused(&env)?;
+        Self::require_approve_milestone_not_paused(&env)?;
+        validator_wallet.require_auth();
+
+        const MAX_BATCH: u32 = 20;
+        if entries.is_empty() || entries.len() > MAX_BATCH {
+            return Err(VerificationError::InvalidInput);
+        }
+
+        // Verify the caller is an active validator once, up-front.
+        let validator: Validator = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Validator(validator_wallet.clone()))
+            .ok_or(VerificationError::ValidatorNotFound)?;
+
+        if !validator.active {
+            return Err(VerificationError::ValidatorInactive);
+        }
+
+        // ── Validation pass (read-only) ────────────────────────────────────
+        // Check every entry before writing anything so the batch is truly
+        // all-or-nothing: all checks must pass before any state mutation.
+        for i in 0..entries.len() {
+            let (player_id, ref description, ref evidence_hash) =
+                entries.get(i).unwrap();
+
+            if description.len() > MAX_DESCRIPTION_LEN {
+                return Err(VerificationError::InvalidInput);
+            }
+
+            validate_cid(evidence_hash).map_err(|_| VerificationError::InvalidInput)?;
+
+            // Global evidence uniqueness check.
+            if env
+                .storage()
+                .persistent()
+                .has(&DataKey::EvidenceUsed(evidence_hash.clone()))
+            {
+                return Err(VerificationError::DuplicateEvidence);
+            }
+
+            // Per-validator-per-player milestone limit.
+            let vp_key =
+                DataKey::ValidatorPlayerMilestoneCount(validator_wallet.clone(), player_id);
+            let vp_count: u32 = env.storage().persistent().get(&vp_key).unwrap_or(0u32);
+            if vp_count >= MAX_MILESTONES_PER_PLAYER_PER_VALIDATOR {
+                return Err(VerificationError::MilestoneLimitExceeded);
+            }
+        }
+
+        // ── Write pass ─────────────────────────────────────────────────────
+        // All validation passed — commit every milestone atomically.
+        let mut indices: Vec<u32> = Vec::new(&env);
+        let now = env.ledger().timestamp();
+        let seq = env.ledger().sequence();
+
+        for i in 0..entries.len() {
+            let (player_id, description, evidence_hash) = entries.get(i).unwrap();
+
+            // Increment per-player milestone counter.
+            let counter_key = DataKey::MilestoneCounter(player_id);
+            let index: u32 = env.storage().persistent().get(&counter_key).unwrap_or(0u32);
+            let next_index = safe_add_u32(index, 1).map_err(|_| VerificationError::Overflow)?;
+
+            let milestone = Milestone {
+                player_id,
+                validator: validator_wallet.clone(),
+                description: description.clone(),
+                evidence_hash: evidence_hash.clone(),
+                approved_at: now,
+                ledger_sequence: seq,
+            };
+
+            env.storage()
+                .persistent()
+                .set(&DataKey::Milestone(player_id, next_index), &milestone);
+            env.storage().persistent().extend_ttl(
+                &DataKey::Milestone(player_id, next_index),
+                PERSISTENT_TTL_MIN,
+                PERSISTENT_TTL_MAX,
+            );
+            env.storage().persistent().set(&counter_key, &next_index);
+            env.storage().persistent().extend_ttl(
+                &counter_key,
+                PERSISTENT_TTL_MIN,
+                PERSISTENT_TTL_MAX,
+            );
+
+            // Mark evidence hash as globally used.
+            let evidence_key = DataKey::EvidenceUsed(evidence_hash.clone());
+            env.storage().persistent().set(&evidence_key, &true);
+            env.storage().persistent().extend_ttl(
+                &evidence_key,
+                PERSISTENT_TTL_MIN,
+                PERSISTENT_TTL_MAX,
+            );
+
+            // Increment per-validator total milestone count.
+            let val_key = DataKey::ValidatorMilestoneCount(validator_wallet.clone());
+            let val_count: u32 = env.storage().persistent().get(&val_key).unwrap_or(0u32);
+            env.storage().persistent().set(
+                &val_key,
+                &(safe_add_u32(val_count, 1).map_err(|_| VerificationError::Overflow)?),
+            );
+            env.storage().persistent().extend_ttl(
+                &val_key,
+                PERSISTENT_TTL_MIN,
+                PERSISTENT_TTL_MAX,
+            );
+
+            // Increment per-validator-per-player milestone count.
+            let vp_key =
+                DataKey::ValidatorPlayerMilestoneCount(validator_wallet.clone(), player_id);
+            let vp_count: u32 = env.storage().persistent().get(&vp_key).unwrap_or(0u32);
+            env.storage().persistent().set(
+                &vp_key,
+                &(safe_add_u32(vp_count, 1).map_err(|_| VerificationError::Overflow)?),
+            );
+
+            // Update ValidatorPlayers index.
+            let vp_index_key = DataKey::ValidatorPlayers(validator_wallet.clone());
+            let mut vp_players: Vec<u64> = env
+                .storage()
+                .persistent()
+                .get(&vp_index_key)
+                .unwrap_or_else(|| Vec::new(&env));
+            if !vp_players.contains(player_id) {
+                vp_players.push_back(player_id);
+                env.storage().persistent().set(&vp_index_key, &vp_players);
+            }
+
+            // Increment global total milestone count.
+            let total: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::TotalMilestoneCount)
+                .unwrap_or(0u32);
+            env.storage().instance().set(
+                &DataKey::TotalMilestoneCount,
+                &(safe_add_u32(total, 1).map_err(|_| VerificationError::Overflow)?),
+            );
+
+            events::milestone_approved(
+                &env,
+                player_id,
+                &validator_wallet,
+                next_index,
+                &description,
+                &evidence_hash,
+            );
+
+            // Cross-contract: advance player level if progress contract is wired.
+            // Failure of any advance_level call aborts the entire batch.
+            if let Some(progress_addr) = env
+                .storage()
+                .instance()
+                .get::<DataKey, Address>(&DataKey::ProgressContract)
+            {
+                let progress_client = progress_contract::Client::new(&env, &progress_addr);
+                match progress_client.try_advance_level(&player_id, &validator_wallet) {
+                    Ok(_) => {}
+                    Err(Ok(progress_contract::Error::AlreadyAtMaxLevel)) => {}
+                    Err(e) => {
+                        let code = match &e {
+                            Ok(pe) => *pe as u32,
+                            Err(_) => 0u32,
+                        };
+                        events::progress_call_failed(&env, player_id, code);
+                        return Err(VerificationError::ProgressCallFailed);
+                    }
+                }
+            } else {
+                events::progress_contract_not_set(&env, player_id);
+            }
+
+            indices.push_back(next_index);
+        }
+
+        Ok(indices)
+    }
+
     // -------------------------------------------------------------------------
     // Queries
     // -------------------------------------------------------------------------
@@ -3674,5 +3873,125 @@ mod tests {
 
         let result = client.get_milestones_since(&999u64, &0u64);
         assert_eq!(result.len(), 0);
+    }
+
+    // -------------------------------------------------------------------------
+    // Issue #859: batch_approve_milestones
+    // -------------------------------------------------------------------------
+
+    fn make_cid(env: &Env, suffix: &str) -> soroban_sdk::String {
+        soroban_sdk::String::from_str(env, &format!("QmPK1s3pNYLi9ERiq3BDxKa4XosgWwFRQUydHUtz4{}", suffix))
+    }
+
+    #[test]
+    fn test_batch_approve_milestones_happy_path() {
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        let validator = Address::generate(&env);
+        client.initialize(&admin);
+        client.register_validator(&validator, &soroban_sdk::String::from_str(&env, "UEFA B License"));
+
+        let entries: soroban_sdk::Vec<(u64, soroban_sdk::String, soroban_sdk::String)> = soroban_sdk::vec![
+            &env,
+            (1u64, soroban_sdk::String::from_str(&env, "Milestone A"), make_cid(&env, "AAAAAAAAa1")),
+            (2u64, soroban_sdk::String::from_str(&env, "Milestone B"), make_cid(&env, "AAAAAAAAb2")),
+        ];
+
+        let indices = client.batch_approve_milestones(&validator, &entries);
+        assert_eq!(indices.len(), 2);
+        assert_eq!(indices.get(0).unwrap(), 1u32);
+        assert_eq!(indices.get(1).unwrap(), 1u32);
+
+        // Verify each milestone is retrievable.
+        let m1 = client.get_milestone(&1u64, &1u32);
+        assert_eq!(m1.player_id, 1u64);
+        let m2 = client.get_milestone(&2u64, &1u32);
+        assert_eq!(m2.player_id, 2u64);
+
+        assert_eq!(client.get_total_milestone_count(), 2u32);
+    }
+
+    /// All-or-nothing: duplicate evidence in second entry must roll back first.
+    #[test]
+    fn test_batch_approve_milestones_duplicate_evidence_rolls_back() {
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        let validator = Address::generate(&env);
+        client.initialize(&admin);
+        client.register_validator(&validator, &soroban_sdk::String::from_str(&env, "UEFA B License"));
+
+        let shared_cid = make_cid(&env, "AAAAAAAASh");
+        let entries: soroban_sdk::Vec<(u64, soroban_sdk::String, soroban_sdk::String)> = soroban_sdk::vec![
+            &env,
+            (1u64, soroban_sdk::String::from_str(&env, "M1"), shared_cid.clone()),
+            (2u64, soroban_sdk::String::from_str(&env, "M2"), shared_cid.clone()), // duplicate
+        ];
+
+        let result = client.try_batch_approve_milestones(&validator, &entries);
+        assert_eq!(result, Err(Ok(VerificationError::DuplicateEvidence)));
+        // Global total must remain 0 (entire batch was rejected).
+        assert_eq!(client.get_total_milestone_count(), 0u32);
+    }
+
+    /// Inactive validator cannot batch-approve.
+    #[test]
+    fn test_batch_approve_milestones_inactive_validator_rejected() {
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        let validator = Address::generate(&env);
+        client.initialize(&admin);
+        client.register_validator(&validator, &soroban_sdk::String::from_str(&env, "UEFA B License"));
+        client.revoke_validator(&validator, &None);
+
+        let entries: soroban_sdk::Vec<(u64, soroban_sdk::String, soroban_sdk::String)> = soroban_sdk::vec![
+            &env,
+            (1u64, soroban_sdk::String::from_str(&env, "M1"), make_cid(&env, "AAAAAAAAIn")),
+        ];
+        let result = client.try_batch_approve_milestones(&validator, &entries);
+        assert_eq!(result, Err(Ok(VerificationError::ValidatorInactive)));
+    }
+
+    /// Empty batch returns InvalidInput.
+    #[test]
+    fn test_batch_approve_milestones_empty_batch_rejected() {
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        let validator = Address::generate(&env);
+        client.initialize(&admin);
+        client.register_validator(&validator, &soroban_sdk::String::from_str(&env, "UEFA B License"));
+
+        let empty: soroban_sdk::Vec<(u64, soroban_sdk::String, soroban_sdk::String)> =
+            soroban_sdk::Vec::new(&env);
+        let result = client.try_batch_approve_milestones(&validator, &empty);
+        assert_eq!(result, Err(Ok(VerificationError::InvalidInput)));
+    }
+
+    /// Per-player-per-validator limit is enforced in batch.
+    #[test]
+    fn test_batch_approve_milestones_milestone_limit_exceeded() {
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        let validator = Address::generate(&env);
+        client.initialize(&admin);
+        client.register_validator(&validator, &soroban_sdk::String::from_str(&env, "UEFA B License"));
+
+        // Pre-fill the per-player-per-validator limit (5) via single approvals.
+        for n in 0..5u32 {
+            let cid = make_cid(&env, &format!("Prefill000{}", n));
+            client.approve_milestone(
+                &validator,
+                &1u64,
+                &soroban_sdk::String::from_str(&env, "Pre"),
+                &cid,
+            );
+        }
+
+        // Now batch with that same player — must fail with MilestoneLimitExceeded.
+        let entries: soroban_sdk::Vec<(u64, soroban_sdk::String, soroban_sdk::String)> = soroban_sdk::vec![
+            &env,
+            (1u64, soroban_sdk::String::from_str(&env, "Extra"), make_cid(&env, "AAAAAAAAEx")),
+        ];
+        let result = client.try_batch_approve_milestones(&validator, &entries);
+        assert_eq!(result, Err(Ok(VerificationError::MilestoneLimitExceeded)));
     }
 }
