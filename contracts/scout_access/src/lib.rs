@@ -382,9 +382,18 @@ impl ScoutAccessContract {
         amount: i128,
     ) -> Result<(), ScoutAccessError> {
         Self::bump_instance_ttl(&env);
-        require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
+        let admin = require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
         if amount <= 0 {
             return Err(ScoutAccessError::InvalidInput);
+        }
+        // Require that the scout has (or had) a subscription record.
+        // Arbitrary refunds to non-subscribers are not permitted.
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::Subscription(scout.clone()))
+        {
+            return Err(ScoutAccessError::ScoutNotSubscribed);
         }
         let xlm = Self::get_token(&env)?;
         let contract_addr = env.current_contract_address();
@@ -393,7 +402,7 @@ impl ScoutAccessContract {
             return Err(ScoutAccessError::InsufficientFee);
         }
         token::Client::new(&env, &xlm).transfer(&contract_addr, &scout, &amount);
-        events::subscription_refunded(&env, &scout, amount);
+        events::subscription_refunded(&env, &scout, &admin, amount);
         Ok(())
     }
 
@@ -3390,6 +3399,7 @@ mod tests {
         assert!(client.health().paused);
     }
 
+    #[test]
     fn test_refund_subscription_success() {
         let (env, admin, xlm, _contract_id, client) = setup();
         let scout = Address::generate(&env);
@@ -3450,6 +3460,17 @@ mod tests {
         // Refund exactly what was paid — within balance
         let result = client.try_refund_subscription(&scout, &1_000_000i128);
         assert!(result.is_ok());
+    }
+
+    /// #1479: refund_subscription must reject refunds to addresses that have
+    /// never held a subscription record, preventing admin errors that would
+    /// drain the contract balance to arbitrary addresses.
+    #[test]
+    fn test_refund_subscription_non_subscriber_rejected() {
+        let (env, _admin, _xlm, _contract_id, client) = setup();
+        let non_subscriber = Address::generate(&env);
+        let result = client.try_refund_subscription(&non_subscriber, &1_000_000i128);
+        assert_eq!(result, Err(Ok(ScoutAccessError::ScoutNotSubscribed)));
     }
 
     // -------------------------------------------------------------------------

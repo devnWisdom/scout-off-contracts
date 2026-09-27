@@ -2106,10 +2106,14 @@ Emergency admin function to return `amount` XLM (stroops) from the contract
 balance to a scout. Use when a scout is accidentally double-charged (e.g. by
 the race condition the upgrade timing guard is designed to prevent).
 
+The scout must have an existing subscription record; refunds to addresses that
+have never subscribed are rejected with `ScoutNotSubscribed`. The admin address
+is included in the emitted `subscription_refunded` event for auditability.
+
 | | |
 |---|---|
 | **Auth** | Admin must sign |
-| **Errors** | `Unauthorized` · `InvalidInput` (amount ≤ 0) |
+| **Errors** | `Unauthorized` · `InvalidInput` (amount ≤ 0) · `ScoutNotSubscribed` (scout has no subscription record) · `InsufficientFee` (amount > contract balance) |
 
 ```bash
 stellar contract invoke --id $SCOUT_ACCESS_CONTRACT_ID \
@@ -2797,7 +2801,7 @@ stellar contract invoke --id $SCOUT_ACCESS_CONTRACT_ID -- version
 | `trial_offer_confirmed` | event_name, scout (Address) | (player_id: u64, index: u32) | Player confirms a pending trial offer before its expiry window closes; escrow released |
 | `trial_offer_expired` | event_name, scout (Address) | (player_id: u64, index: u32) | Trial offer confirmation window elapsed; escrowed fee refunded to scout |
 | `fees_withdrawn` | event_name, admin (Address) | (to: Address, amount: i128, timestamp: u64) | Admin withdraws accumulated fees |
-| `subscription_refunded` | event_name, scout (Address) | amount (i128) | Admin issues emergency refund to a scout |
+| `subscription_refunded` | event_name, scout (Address) | (admin (Address), amount (i128)) | Admin issues emergency refund to a scout |
 | `admin_transfer_proposed` | event_name, old_admin (Address) | new_admin (Address) | Admin replacement proposed |
 | `admin_transferred` | event_name, old_admin (Address) | new_admin (Address) | Admin rights rotated |
 | `contract_paused` | event_name, admin (Address) | () | Circuit breaker engaged |
@@ -3195,7 +3199,7 @@ All events follow the unified `(Symbol, actor)` topic schema introduced in #246.
 | `trial_offer_confirmed` | event_name, scout (Address) | player_id (u64), index (u32) | Player confirms a pending trial offer before its expiry window closes; escrow released |
 | `trial_offer_expired` | event_name, scout (Address) | player_id (u64), index (u32) | Trial offer confirmation window elapsed; escrowed fee refunded to scout |
 | `fees_withdrawn` | event_name, admin (Address) | to (Address), amount (i128), timestamp (u64) | Admin withdraws accumulated fees |
-| `subscription_refunded` | event_name, scout (Address) | amount (i128) | Admin issues emergency refund to a scout |
+| `subscription_refunded` | event_name, scout (Address) | (admin (Address), amount (i128)) | Admin issues emergency refund to a scout |
 | `fee_config_updated` | event_name, admin (Address) | old_config (FeeConfig), new_config (FeeConfig) | Fee configuration changed |
 | `progress_contract_updated` | event_name, admin (Address) | progress_contract (Address) | Progress contract re-wired |
 | `admin_transfer_proposed` | event_name, old_admin (Address) | new_admin (Address) | Current admin proposes a replacement |
