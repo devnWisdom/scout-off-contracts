@@ -784,7 +784,7 @@ impl ScoutAccessContract {
     /// 3. Write contact record to persistent storage (prevents duplicate contacts).
     ///
     /// Scout must have an active, non-expired subscription.
-    /// Pro tier scouts are limited to `pro_contact_limit` contacts per month.
+    /// Pro tier scouts are limited to `pro_contact_limit` contacts per subscription period; the count resets when the subscription renews.
     pub fn pay_to_contact(
         env: Env,
         scout: Address,
@@ -804,10 +804,7 @@ impl ScoutAccessContract {
             return Err(ScoutAccessError::SubscriptionExpired);
         }
 
-        // Pro-tier quota is enforced below via `ProContactCount`, which resets
-        // on subscription renewal (issue #19). `check_pro_contact_quota` uses
-        // a wall-clock month bucket instead and would reject a call before the
-        // renewal-aware check below gets a chance to run, so it isn't used here.
+        // Pro-tier quota is enforced below via ProContactCount keyed on subscribed_at; the counter resets automatically on renewal.
 
         let contact_key = DataKey::ContactRecord(player_id, scout.clone());
         if env.storage().persistent().has(&contact_key) {
@@ -914,7 +911,7 @@ impl ScoutAccessContract {
     /// that were recorded.
     ///
     /// Scout must have an active (non-expired) subscription.
-    /// Pro tier scouts are limited to `pro_contact_limit` contacts per month.
+    /// Pro tier scouts are limited to `pro_contact_limit` contacts per subscription period; the count resets when the subscription renews.
     pub fn batch_contact_players(
         env: Env,
         scout: Address,

@@ -105,7 +105,7 @@ pub struct FeeConfig {
     pub elite_sub_stroops: i128,
     /// Subscription duration in seconds (default: 30 days)
     pub sub_duration_secs: u64,
-    /// Maximum contacts per month for Pro tier (default: 10)
+    /// Maximum contacts per subscription period for Pro tier (default: 10). Resets on renewal.
     pub pro_contact_limit: u32,
     /// Escrow amount for trial offers (stroops)
     pub trial_offer_escrow_stroops: i128,
